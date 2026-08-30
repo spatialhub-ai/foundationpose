@@ -222,6 +222,291 @@ def make_mesh_tensors(mesh, device='cuda', max_tex_size=None):
   })
   return mesh_tensors
 
+shader_prog = None
+def create_moderngl_context(standalone = True):
+    return moderngl.create_context(standalone=standalone)
+
+def get_moderngl_program(ctx: moderngl.Context) -> moderngl.Program:
+    global shader_prog
+    
+    vertex_shader = '''
+        #version 330
+        in vec3 in_position;
+        in vec3 in_normal;
+        in vec3 in_color;
+        in vec2 in_uv;
+        
+        in mat4 in_pose;       // Extrinsic pose matrix
+        in mat4 in_clip_mat;   // Combined projection + crop matrix
+        
+        uniform float C;
+        uniform float R;
+        
+        out vec3 v_cam_pos;
+        out vec3 v_cam_normal;
+        out vec3 v_color;
+        out vec2 v_uv;
+        out vec2 v_ndc;        // FIX 1: Pass original NDC for clipping
+
+        void main() {
+            vec4 pos_cam = in_pose * vec4(in_position, 1.0);
+            v_cam_pos = pos_cam.xyz;
+            
+            v_cam_normal = mat3(in_pose) * in_normal; 
+            v_color = in_color;
+            v_uv = in_uv;
+            
+            vec4 pos_clip = in_clip_mat * vec4(in_position, 1.0);
+            
+            // Capture original NDC for fragment discard (prevents atlas bleeding)
+            v_ndc = pos_clip.xy / pos_clip.w;
+            
+            // Atlas Grid Mapping
+            float sx = 1.0 / C;
+            float sy = 1.0 / R;
+            int gx = gl_InstanceID % int(C);
+            int gy = gl_InstanceID / int(C);
+            
+            float tx = -1.0 + (2.0 * float(gx) + 1.0) * sx;
+            float ty = -1.0 + (2.0 * float(gy) + 1.0) * sy; 
+            
+            pos_clip.x = pos_clip.x * sx + pos_clip.w * tx;
+            pos_clip.y = pos_clip.y * sy + pos_clip.w * ty;
+            
+            gl_Position = pos_clip;
+        }
+    '''
+        
+    fragment_shader = '''
+        #version 330
+        in vec3 v_cam_pos;
+        in vec3 v_cam_normal;
+        in vec3 v_color;
+        in vec2 v_uv;
+        in vec2 v_ndc;
+
+        layout(location = 0) out vec4 f_color;
+        layout(location = 1) out vec4 f_xyz;
+        layout(location = 2) out vec4 f_normal;
+
+        uniform int use_light;
+        uniform int use_dir_light;
+        uniform int has_tex;
+        uniform vec3 light_dir;
+        uniform vec3 light_pos;
+        uniform vec3 light_color;
+        uniform float w_ambient;
+        uniform float w_diffuse;
+        uniform sampler2D tex_sampler;
+
+        void main() {
+            // Manual clipping to prevent bleeding into adjacent atlas cells
+            if (abs(v_ndc.x) > 1.0 || abs(v_ndc.y) > 1.0) {
+                discard;
+            }
+        
+            vec3 n = normalize(v_cam_normal);
+            vec3 base_color = v_color;
+            
+            if (has_tex == 1) {
+                base_color = texture(tex_sampler, v_uv).rgb;
+            }
+            
+            vec3 final_color = base_color;
+            if (use_light == 1) {
+                vec3 l_dir;
+                if (use_dir_light == 1) {
+                    l_dir = normalize(-light_dir);
+                } else {
+                    l_dir = normalize(light_pos - v_cam_pos);
+                }
+                float diff = clamp(dot(n, l_dir), 0.0, 1.0);
+                final_color = base_color * w_ambient + diff * light_color * w_diffuse;
+            }
+            
+            f_color = vec4(clamp(final_color, 0.0, 1.0), 1.0);
+            f_xyz = vec4(v_cam_pos, 1.0);
+            f_normal = vec4(n, 1.0);
+        }
+    '''
+    shader_prog = ctx.program(vertex_shader=vertex_shader, fragment_shader=fragment_shader)
+    return shader_prog
+  
+def moderngl_render(K, H, W, ob_in_cams, glctx: moderngl.Context, get_normal=False, mesh_tensors=None, mesh=None, projection_mat=None, bbox2d=None, output_size=None, use_light=False, light_color=None, light_dir=np.array([0,0,1]), light_pos=np.array([0,0,0]), w_ambient=0.8, w_diffuse=0.5, extra={}):
+    '''Just plain rendering
+        @K: (3,3) np array
+        @ob_in_cams: (N,4,4) torch tensor, openCV camera
+        @projection_mat: np array (4,4)
+        @output_size: (height, width)
+        @bbox2d: (N,4) (umin,vmin,umax,vmax) if only roi need to render.
+        @light_dir: in cam space
+        @light_pos: in cam space
+    '''
+    global shader_prog
+
+    if mesh_tensors is None:
+        mesh_tensors = make_mesh_tensors(mesh)
+
+    has_tex = 'tex' in mesh_tensors
+    if output_size is None:
+        output_size = np.asarray([H, W])
+
+    if shader_prog is None:
+        shader_prog = get_moderngl_program(glctx)
+
+    N = len(ob_in_cams)
+    out_H, out_W = int(output_size[0]), int(output_size[1])
+    
+    # Atlas calculation for batched rendering
+    C = int(np.ceil(np.sqrt(N)))
+    R = int(np.ceil(N / C))
+    atlas_W = C * out_W
+    atlas_H = R * out_H
+    
+    shader_prog['C'].value = C
+    shader_prog['R'].value = R
+    shader_prog['use_light'].value = 1 if use_light else 0
+    shader_prog['has_tex'].value = 1 if has_tex else 0
+    
+    if use_light:
+        shader_prog['w_ambient'].value = w_ambient
+        shader_prog['w_diffuse'].value = w_diffuse
+        shader_prog['use_dir_light'].value = 1 if light_dir is not None else 0
+        shader_prog['light_dir'].value = tuple(light_dir) if light_dir is not None else (0,0,1)
+        shader_prog['light_pos'].value = tuple(light_pos) if light_pos is not None else (0,0,0)
+        shader_prog['light_color'].value = tuple(light_color) if light_color is not None else (1.0, 1.0, 1.0)
+
+    # Geometry Buffers
+    pos_buffer = glctx.buffer(mesh_tensors['pos'].contiguous().cpu().numpy().tobytes())
+    norm_buffer = glctx.buffer(mesh_tensors['vnormals'].contiguous().cpu().numpy().tobytes())
+    idx_buffer = glctx.buffer(mesh_tensors['faces'].to(torch.int32).contiguous().cpu().numpy().tobytes())
+    
+    color_buffer = None
+    uv_buffer = None
+    tex_obj = None
+    
+    if has_tex:
+        uvs = mesh_tensors['uv'].contiguous().cpu().numpy()
+        uv_buffer = glctx.buffer(uvs.tobytes())
+        # Basic dummy color buffer to satisfy VAO
+        color_buffer = glctx.buffer(np.ones_like(mesh_tensors['pos'].cpu().numpy()).tobytes())
+
+        # Prepare Texture
+        tex_data = mesh_tensors['tex'].contiguous().cpu().numpy()
+        if tex_data.ndim == 4:
+            tex_data = tex_data[0]
+
+        tex_obj = glctx.texture((tex_data.shape[1], tex_data.shape[0]), tex_data.shape[2], tex_data.tobytes(), dtype='f4')
+        tex_obj.use(0)
+        shader_prog['tex_sampler'].value = 0
+    else:
+        color_buffer = glctx.buffer(mesh_tensors['vertex_color'].contiguous().cpu().numpy().tobytes())
+        # Dummy UV buffer
+        uv_buffer = glctx.buffer(np.zeros((mesh_tensors['pos'].shape[0], 2), dtype=np.float32).tobytes())
+
+    # Instancing Buffers (Matrices)
+    ob_in_glcams = torch.tensor(glcam_in_cvcam, device='cuda', dtype=torch.float)[None] @ ob_in_cams
+    if projection_mat is None:
+        projection_mat = projection_matrix_from_intrinsics(K, height=H, width=W, znear=0.001, zfar=100)
+    projection_mat = torch.as_tensor(projection_mat.reshape(-1,4,4), device='cuda', dtype=torch.float)
+    mtx = projection_mat @ ob_in_glcams
+    
+    if bbox2d is not None:
+        l = bbox2d[:,0]
+        t = H-bbox2d[:,1]
+        r = bbox2d[:,2]
+        b = H-bbox2d[:,3]
+        tf = torch.eye(4, dtype=torch.float, device='cuda').reshape(1,4,4).expand(N,4,4).contiguous()
+        tf[:,0,0] = float(W)/(r-l)
+        tf[:,1,1] = float(H)/(t-b)
+        tf[:,3,0] = (float(W)-r-l)/(r-l)
+        tf[:,3,1] = (float(H)-t-b)/(t-b)
+        final_mtx = torch.bmm(tf.transpose(1, 2), mtx)
+    else:
+        final_mtx = mtx
+
+    # Converts to column-major before converting to bytes.
+    pose_data = ob_in_cams.transpose(1, 2).contiguous().cpu().numpy().tobytes()
+    clip_data = final_mtx.transpose(1, 2).contiguous().cpu().numpy().tobytes()
+
+    pose_buffer = glctx.buffer(pose_data)
+    clip_buffer = glctx.buffer(clip_data)
+
+    # Setup VAO
+    vao = glctx.vertex_array(
+        shader_prog,
+        [
+            (pos_buffer, '3f', 'in_position'),
+            (norm_buffer, '3f', 'in_normal'),
+            (color_buffer, '3f', 'in_color'),
+            (uv_buffer, '2f', 'in_uv'),
+            (pose_buffer, '16f/i', 'in_pose'),
+            (clip_buffer, '16f/i', 'in_clip_mat'),
+        ],
+        idx_buffer
+        )
+
+    # Framebuffers
+    color_tex = glctx.texture((atlas_W, atlas_H), 4, dtype='f4')
+    xyz_tex = glctx.texture((atlas_W, atlas_H), 4, dtype='f4')
+    normal_tex = glctx.texture((atlas_W, atlas_H), 4, dtype='f4')
+    depth_rb = glctx.depth_renderbuffer((atlas_W, atlas_H))
+    
+    fbo = glctx.framebuffer(color_attachments=[color_tex, xyz_tex, normal_tex], depth_attachment=depth_rb)
+    
+    # Render
+    fbo.use()
+    fbo.clear(0.0, 0.0, 0.0, 0.0)
+    glctx.enable(moderngl.DEPTH_TEST)
+    vao.render(moderngl.TRIANGLES, instances=N)
+
+    # Read back logic
+    def unpack_atlas(tex):
+        data = tex.read()
+        # Read back as flat tensor, move to CUDA, reshape to image
+        tensor = torch.frombuffer(bytearray(data), dtype=torch.float32).view(atlas_H, atlas_W, 4).cuda()
+        # Grid to Batch
+        tensor = tensor.view(R, out_H, C, out_W, 4).permute(0, 2, 1, 3, 4).reshape(R*C, out_H, out_W, 4)
+        # Return all 4 channels for the valid batch items
+        return tensor[:N]
+
+    # Extract Color and Alpha
+    color_full = unpack_atlas(color_tex)
+    color = color_full[..., :3]
+    alpha = color_full[..., 3:]
+    
+    # Extract XYZ and Depth
+    xyz_full = unpack_atlas(xyz_tex)
+    xyz_map = xyz_full[..., :3]
+    # In ModernGL, Z is the 3rd component of xyz_map. 
+    depth = xyz_map[..., 2]
+    
+    if get_normal:
+        normal_full = unpack_atlas(normal_tex)
+        normal_map = normal_full[..., :3]
+        normal_map = F.normalize(normal_map, dim=-1)
+        normal_map = torch.flip(normal_map, dims=[1])
+    else:
+        normal_map = None
+    
+    # Mask out background using alpha
+    color = color * torch.clamp(alpha, 0, 1) 
+    
+    # ModernGL reads upside down relative to PyTorch, mirroring NVDiffrast flips.
+    color = torch.flip(color, dims=[1])
+    depth = torch.flip(depth, dims=[1])
+    extra['xyz_map'] = torch.flip(xyz_map, dims=[1])
+
+    # Cleanup memory
+    vao.release()
+    pos_buffer.release(); norm_buffer.release(); idx_buffer.release()
+    color_buffer.release(); uv_buffer.release()
+    pose_buffer.release(); clip_buffer.release()
+    color_tex.release(); xyz_tex.release(); normal_tex.release(); depth_rb.release()
+    fbo.release()
+    if tex_obj is not None: tex_obj.release()
+
+    return color, depth, normal_map
 
 def nvdiffrast_render(K=None, H=None, W=None, ob_in_cams=None, glctx=None, context='cuda', get_normal=False, mesh_tensors=None, mesh=None, projection_mat=None, bbox2d=None, output_size=None, use_light=False, light_color=None, light_dir=np.array([0,0,1]), light_pos=np.array([0,0,0]), w_ambient=0.8, w_diffuse=0.5, extra={}):
   '''Just plain rendering, not support any gradient

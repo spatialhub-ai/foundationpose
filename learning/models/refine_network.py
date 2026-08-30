@@ -74,7 +74,7 @@ class RefineNet(nn.Module):
     """
     @A: (B,C,H,W)
     """
-    bs = len(A)
+    bs = A.shape[0]
     output = {}
 
     x = torch.cat([A,B], dim=0)
