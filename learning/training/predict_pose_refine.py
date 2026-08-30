@@ -19,6 +19,7 @@ from learning.models.refine_network import RefineNet
 from learning.datasets.h5_dataset import *
 from Utils import *
 from datareader import *
+import roma
 
 
 
@@ -219,9 +220,9 @@ class PoseRefinePredictor:
 
         if self.cfg['rot_rep']=='axis_angle':
           rot_mat_delta = torch.tanh(output["rot"])*self.cfg['rot_normalizer']
-          rot_mat_delta = so3_exp_map(rot_mat_delta).permute(0,2,1)
+          rot_mat_delta = roma.rotvec_to_rotmat(rot_mat_delta).permute(0,2,1)
         elif self.cfg['rot_rep']=='6d':
-          rot_mat_delta = rotation_6d_to_matrix(output['rot']).permute(0,2,1)
+          rot_mat_delta = roma.special_gramschmidt(output['rot']).permute(0,2,1)
         else:
           raise RuntimeError
 

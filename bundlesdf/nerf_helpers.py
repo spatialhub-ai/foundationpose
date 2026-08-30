@@ -14,13 +14,46 @@ import numpy as np
 code_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(f'{code_dir}/../')
 from Utils import *
-from pytorch3d.transforms import so3_log_map,so3_exp_map,se3_exp_map
+import roma
 
 img2mse = lambda x, y : torch.mean((x - y) ** 2)
 img2mae = lambda x, y: (torch.abs(x - y)).mean()
 mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
 to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
 
+
+def se3_exp_map(log_transform: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
+    """
+    Converts a batch of 6D se(3) vectors [trans, rot] to 4x4 SE(3) transformation matrices.
+    """
+    trans = log_transform[..., :3]
+    rot = log_transform[..., 3:6]
+
+    # Convert rotation vector to SO(3) matrix via roma
+    R = roma.rotvec_to_rotmat(rot)
+
+    theta = torch.norm(rot, p=2, dim=-1, keepdim=True)
+    theta_clamped = torch.clamp(theta, min=eps)
+
+    # Skew-symmetric matrix
+    x, y, z = rot[..., 0], rot[..., 1], rot[..., 2]
+    zeros = torch.zeros_like(x)
+    hat = torch.stack([zeros, -z, y, z, zeros, -x, -y, x, zeros], dim=-1).view(*rot.shape[:-1], 3, 3)
+
+    eye = torch.eye(3, dtype=rot.dtype, device=rot.device)
+    small_angle = theta < eps
+
+    c1 = torch.where(small_angle, 0.5 - (theta**2) / 24.0, (1.0 - torch.cos(theta)) / (theta_clamped**2),).unsqueeze(-1)
+    c2 = torch.where(small_angle, 1.0 / 6.0 - (theta**2) / 120.0, (theta - torch.sin(theta)) / (theta_clamped**3),).unsqueeze(-1)
+
+    # V matrix computes the coupled translation component
+    V = eye + c1 * hat + c2 * torch.matmul(hat, hat)
+    t = torch.matmul(V, trans.unsqueeze(-1))
+
+    T = torch.eye(4, dtype=rot.dtype, device=rot.device).repeat(*rot.shape[:-1], 1, 1)
+    T[..., :3, :3] = R
+    T[..., :3, 3:] = t
+    return T
 
 class FeatureArray(nn.Module):
     """

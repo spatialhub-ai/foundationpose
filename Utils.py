@@ -7,13 +7,14 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 
-import os, sys, time,torch,pickle,trimesh,itertools,pdb,zipfile,datetime,imageio,gzip,logging,joblib,importlib,uuid,signal,multiprocessing,psutil,subprocess,tarfile,scipy,argparse
-from pytorch3d.transforms import so3_log_map,so3_exp_map,se3_exp_map,se3_log_map,matrix_to_axis_angle,matrix_to_euler_angles,euler_angles_to_matrix, rotation_6d_to_matrix
-from pytorch3d.renderer import FoVPerspectiveCameras, PerspectiveCameras, look_at_view_transform, look_at_rotation, RasterizationSettings, MeshRenderer, MeshRasterizer, BlendParams, SoftSilhouetteShader, HardPhongShader, PointLights, TexturesVertex
-from pytorch3d.renderer.mesh.rasterize_meshes import barycentric_coordinates
-from pytorch3d.renderer.mesh.shader import SoftDepthShader, HardFlatShader
-from pytorch3d.renderer.mesh.textures import Textures
-from pytorch3d.structures import Meshes
+import os, sys, time,torch,pickle,trimesh,itertools,pdb,zipfile,datetime,imageio,gzip,logging,joblib,importlib,uuid,signal,multiprocessing,subprocess,tarfile,scipy,argparse
+# from pytorch3d.transforms import so3_log_map,so3_exp_map,se3_exp_map,se3_log_map,matrix_to_axis_angle,matrix_to_euler_angles,euler_angles_to_matrix, rotation_6d_to_matrix
+# from pytorch3d.renderer import FoVPerspectiveCameras, PerspectiveCameras, look_at_view_transform, look_at_rotation, RasterizationSettings, MeshRenderer, MeshRasterizer, BlendParams, SoftSilhouetteShader, HardPhongShader, PointLights, TexturesVertex
+# from pytorch3d.renderer.mesh.rasterize_meshes import barycentric_coordinates
+# from pytorch3d.renderer.mesh.shader import SoftDepthShader, HardFlatShader
+# from pytorch3d.renderer.mesh.textures import Textures
+# from pytorch3d.structures import Meshes
+import moderngl
 from scipy.interpolate import griddata
 import nvdiffrast.torch as dr
 import torch.nn.functional as F
@@ -30,11 +31,11 @@ from collections import defaultdict
 import multiprocessing as mp
 import matplotlib.pyplot as plt
 import math,glob,re,copy
-from transformations import *
+# from transformations import *
 from scipy.spatial import cKDTree
 from collections import OrderedDict
-import ruamel.yaml
-yaml = ruamel.yaml.YAML()
+# import ruamel.yaml
+# yaml = ruamel.yaml.YAML()
 code_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(code_dir)
 try:
@@ -100,7 +101,97 @@ def set_logging_format(level=logging.INFO):
 
 set_logging_format()
 
+def euler_matrix(ai, aj, ak, axes='sxyz'):
+    """
+    Return homogeneous 4x4 rotation matrix from Euler angles (ai, aj, ak).
+    """
+    # Rotations around X, Y, Z
+    cx, sx = np.cos(ai), np.sin(ai)
+    cy, sy = np.cos(aj), np.sin(aj)
+    cz, sz = np.cos(ak), np.sin(ak)
 
+    # For default static 'sxyz' convention (R = Rz * Ry * Rx)
+    R = np.eye(4, dtype=np.float64)
+    R[0, 0] = cy * cz
+    R[0, 1] = -cy * sz
+    R[0, 2] = sy
+    R[1, 0] = cz * sx * sy + cx * sz
+    R[1, 1] = -sx * sy * sz + cx * cz
+    R[1, 2] = -sx * cy
+    R[2, 0] = -cx * cz * sy + sx * sz
+    R[2, 1] = cx * sy * sz + sx * cz
+    R[2, 2] = cx * cy
+    return R
+
+
+def rotation_geodesic_distance(R1: np.ndarray, R2: np.ndarray) -> float:
+    """
+    Computes geodesic distance (difference angle in radians) between two 3x3 rotation matrices.
+    Replacement for Utils::rotationGeodesicDistance.
+    """
+    cos = ((np.trace(R1 @ R2.T)) - 1.0) / 2.0
+    cos = np.clip(cos, -1.0, 1.0)
+    return float(np.arccos(cos))
+
+
+def cluster_poses(angle_diff: float, dist_diff: float, poses_in: np.ndarray, symmetry_tfs: np.ndarray,) -> np.ndarray:
+    """
+    Greedy pose clustering under object symmetry transforms.
+    Replacement to C++ mycpp.cluster_poses.
+
+    Args:
+        angle_diff: Angular threshold in degrees.
+        dist_diff: Distance threshold in meters.
+        poses_in: Array of candidate poses of shape (N, 4, 4).
+        symmetry_tfs: Array of symmetry transforms of shape (M, 4, 4).
+
+    Returns:
+        Clustered poses array of shape (K, 4, 4).
+    """
+    print(f"num original candidates = {len(poses_in)}")
+    if len(poses_in) == 0:
+        return np.empty((0, 4, 4), dtype=np.float32)
+
+    poses_in = np.asarray(poses_in, dtype=np.float32)
+    symmetry_tfs = np.asarray(symmetry_tfs, dtype=np.float32)
+    if symmetry_tfs.ndim == 2:
+        symmetry_tfs = symmetry_tfs[None, ...]
+
+    poses_out = [poses_in[0]]
+    radian_thres = float(angle_diff / 180.0 * np.pi)
+
+    for i in range(1, len(poses_in)):
+        isnew = True
+        cur_pose = poses_in[i]
+        t1 = cur_pose[:3, 3]
+
+        for cluster in poses_out:
+            t0 = cluster[:3, 3]
+
+            # Translation distance check
+            if np.linalg.norm(t0 - t1) >= dist_diff:
+                continue
+
+            R_cluster = cluster[:3, :3]
+
+            # Symmetry rotation check
+            for tf in symmetry_tfs:
+                cur_pose_tmp = cur_pose @ tf
+                R_tmp = cur_pose_tmp[:3, :3]
+
+                rot_diff = rotation_geodesic_distance(R_tmp, R_cluster)
+                if rot_diff < radian_thres:
+                    isnew = False
+                    break
+
+            if not isnew:
+                break
+
+        if isnew:
+            poses_out.append(cur_pose)
+
+    print(f"num of pose after clustering: {len(poses_out)}")
+    return np.asarray(poses_out, dtype=np.float32)
 
 
 def make_mesh_tensors(mesh, device='cuda', max_tex_size=None):
