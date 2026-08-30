@@ -1,0 +1,40 @@
+[project]
+name = "foundationpose"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "torch==2.6.0",
+    "torchvision==0.21.0",
+    "ninja",
+    "setuptools<=69.5.1",
+    "wheel",
+    "nvdiffrast @ git+https://github.com/NVlabs/nvdiffrast.git",
+    "numpy",
+    "scipy",
+    "kornia",
+    "trimesh",
+    "open3d",
+    "opencv-contrib-python",
+    "imageio",
+    "omegaconf",
+    "joblib",
+    "warp-lang>=1.16.0",
+    "h5py>=3.16.0",
+    "roma>=1.6.1",
+    "moderngl>=5.12.0",
+    "onnx>=1.22.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv]
+no-build-isolation-package = ["nvdiffrast"]
