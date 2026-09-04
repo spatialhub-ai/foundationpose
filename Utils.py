@@ -246,7 +246,7 @@ def get_moderngl_program(ctx: moderngl.Context) -> moderngl.Program:
         out vec3 v_cam_normal;
         out vec3 v_color;
         out vec2 v_uv;
-        out vec2 v_ndc;        // FIX 1: Pass original NDC for clipping
+        out vec2 v_ndc;
 
         void main() {
             vec4 pos_cam = in_pose * vec4(in_position, 1.0);

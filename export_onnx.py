@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
+import math
 from pathlib import Path
 from typing import Union, Tuple, Optional, Dict, Any
 
 import onnx
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 
 from learning.models.refine_network import RefineNet
@@ -27,21 +28,99 @@ torch.backends.mha.set_fastpath_enabled(False)
 
 class ScoreNetONNXWrapper(nn.Module):
     """
-    PyTorch Module wrapper that exposes ScoreNetMultiPair outputs as a tensor graph.
+    PyTorch Module wrapper for exporting ScoreNetMultiPair pose candidate scoring network to ONNX format.
+
+    Replaces PyTorch native nn.MultiheadAttention cross-candidate attention (att_cross) with an
+    explicit linear projection and scaled dot-product self-attention implementation (_dynamic_attention).
 
     Attributes:
-        model (ScoreNetMultiPair): Underlying ScoreNet instance.
+        model (ScoreNetMultiPair): Pre-trained underlying ScoreNet network instance.
+        embed_dim (int): Cross-attention embedding dimension (512).
+        num_heads (int): Number of multi-head attention heads (4).
+        head_dim (int): Dimensionality per attention head (embed_dim // num_heads = 128).
+        scale (float): Scaled dot-product normalization factor (1.0 / sqrt(head_dim)).
+        qkv_weight (torch.Tensor): Weight tensor for combined Query, Key, and Value projections.
+        qkv_bias (torch.Tensor): Bias tensor for combined Query, Key, and Value projections.
+        out_weight (torch.Tensor): Output linear projection weight tensor.
+        out_bias (torch.Tensor): Output linear projection bias tensor.
     """
 
     def __init__(self, model: ScoreNetMultiPair):
+        """
+        Initialize the ONNX wrapper, extracting weight and bias tensors from ScoreNetMultiPair.att_cross.
+
+        Args:
+            model: Pre-trained ScoreNetMultiPair model instance.
+        """
         super().__init__()
         self.model = model
 
+        # Extract attention dimensions from the underlying att_cross multi-head attention module
+        mha = self.model.att_cross
+        self.embed_dim = mha.embed_dim
+        self.num_heads = mha.num_heads
+        self.head_dim = self.embed_dim // self.num_heads
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+
+        # Extract QKV in-projection and output projection weights and biases
+        self.qkv_weight = mha.in_proj_weight
+        self.qkv_bias = mha.in_proj_bias
+        self.out_weight = mha.out_proj.weight
+        self.out_bias = mha.out_proj.bias
+
+    def _dynamic_attention(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute multi-head self-attention over candidate pose features.
+
+        Args:
+            x: Input candidate feature tensor of shape (L, 512).
+
+        Returns:
+            Attended candidate feature tensor of shape (L, 512).
+        """
+
+        # Linear in-projection for Query, Key, and Value: (L, 512) -> (L, 1536)
+        qkv = F.linear(x, self.qkv_weight, self.qkv_bias)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        # Reshape and permute into multi-head layouts: (num_heads, L, head_dim)
+        q = q.reshape(-1, self.num_heads, self.head_dim).permute(1, 0, 2)
+        k = k.reshape(-1, self.num_heads, self.head_dim).permute(1, 0, 2)
+        v = v.reshape(-1, self.num_heads, self.head_dim).permute(1, 0, 2)
+
+        # Scaled dot-product attention scores: (num_heads, L, L)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn_weights = F.softmax(scores, dim=-1)
+
+        # Weighted combination of Value vectors: (num_heads, L, head_dim) -> (L, 512)
+        attn_out = torch.matmul(attn_weights, v)
+        attn_out = attn_out.permute(1, 0, 2).reshape(-1, self.embed_dim)
+
+        # Final linear out-projection: (L, 512) -> (L, 512)
+        out = F.linear(attn_out, self.out_weight, self.out_bias)
+        return out
+
     def forward(self, input_render_A: torch.Tensor, input_real_B: torch.Tensor) -> torch.Tensor:
-        # Dynamically calculate L from the batch dimension
-        L = input_render_A.shape[0]
-        out = self.model(input_render_A, input_real_B, L)
-        return out["score_logit"]
+        """
+        Execute ScoreNet forward pass over rendered template and real observed crops.
+
+        Args:
+            input_render_A: Rendered candidate crop tensor of shape (L, C, H, W).
+            input_real_B: Real observed crop tensor of shape (L, C, H, W).
+
+        Returns:
+            1D tensor of candidate score logits of shape (L,).
+        """
+        # Feature extraction via ScoreNetMultiPair.extract_feat: returns (L, 512)
+        feats = self.model.extract_feat(input_render_A, input_real_B)
+
+        # Self-attention over candidates using explicit matrix math
+        x = self._dynamic_attention(feats)
+
+        # Final linear projection: (L, 512) -> (L,)
+        scores = self.model.linear(x).reshape(-1)
+
+        return scores
 
 
 def load_refine_net(cfg_path: Union[str, Path], ckpt_dir: Union[str, Path]) -> RefineNet:
@@ -194,7 +273,7 @@ def export_scorenet(
     else:
         height, width = 160, 160
 
-    num_poses = 2
+    num_poses = 5
     dummy_input_render_A = torch.randn(num_poses, c_in, height, width, device=device, dtype=torch.float32)
     dummy_input_real_B = torch.randn(num_poses, c_in, height, width, device=device, dtype=torch.float32)
 
