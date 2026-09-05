@@ -40,7 +40,7 @@ if __name__=='__main__':
   if args.renderer_backend == 'cuda':
     glctx = dr.RasterizeCudaContext()
   else:
-      glctx = create_moderngl_context()
+    glctx = create_moderngl_context()
   est = FoundationPose(model_pts=mesh.vertices, model_normals=mesh.vertex_normals, mesh=mesh, scorer=scorer, refiner=refiner, debug_dir=debug_dir, debug=debug, glctx=glctx)
   logging.info("estimator initialization done")
 
