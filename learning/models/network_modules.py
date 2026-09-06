@@ -7,7 +7,7 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 
-import os,sys,copy,math,tqdm
+import os,sys,copy,math
 import numpy as np
 dir_path = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(dir_path)
@@ -15,9 +15,9 @@ import torch.nn.functional as F
 import torch
 import torch.nn as nn
 import time
-import cv2
+# import cv2
 sys.path.append(f'{dir_path}/../../../../')
-from Utils import *
+# from Utils import *
 
 
 
